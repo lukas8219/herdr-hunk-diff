@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { join } from "node:path";
 import { DEFAULTS } from "../src/config.js";
 import { HerdrAdapter, resolveHunkLauncher } from "../src/herdr.js";
@@ -82,6 +82,51 @@ describe("resolveHunkLauncher", () => {
         },
       });
       expect(called).toBe(false);
+    });
+
+    describe("debug tracing (visible via `herdr plugin log list`)", () => {
+      it("logs which sandbox it routed hunk through", () => {
+        const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+        const lookup: SandboxLookup = {
+          exists: () => false,
+          listSandboxes: () => [{ name: "my-sandbox", workspace: "/wt/project" }],
+        };
+        resolveHunkLauncher(DEFAULTS, "/plugin", "/wt/project", "/bin/node", lookup);
+        expect(errorSpy).toHaveBeenCalledWith(
+          expect.stringContaining('sbx exec my-sandbox -- hunk" for "/wt/project"'),
+        );
+        errorSpy.mockRestore();
+      });
+
+      it("logs why it fell back to local hunk when no sandbox matches", () => {
+        const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+        const lookup: SandboxLookup = { exists: () => false, listSandboxes: () => [] };
+        resolveHunkLauncher(DEFAULTS, "/plugin", "/wt/project", "/bin/node", lookup);
+        expect(errorSpy).toHaveBeenCalledWith(
+          expect.stringContaining('no sandbox workspace matches "/wt/project"'),
+        );
+        errorSpy.mockRestore();
+      });
+
+      it("logs the underlying error when sbx itself is unavailable", () => {
+        const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+        const lookup: SandboxLookup = {
+          exists: () => false,
+          listSandboxes: () => {
+            throw new Error("spawn sbx ENOENT");
+          },
+        };
+        resolveHunkLauncher(DEFAULTS, "/plugin", "/wt/project", "/bin/node", lookup);
+        expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("spawn sbx ENOENT"));
+        errorSpy.mockRestore();
+      });
+
+      it("stays silent when the worktree already exists locally", () => {
+        const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+        resolveHunkLauncher(DEFAULTS, "/plugin", "/wt", "/bin/node", LOCAL_LOOKUP);
+        expect(errorSpy).not.toHaveBeenCalled();
+        errorSpy.mockRestore();
+      });
     });
   });
 });
