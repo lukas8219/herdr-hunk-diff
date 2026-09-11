@@ -24,17 +24,20 @@ export function reportFailure(herdr: { notify: (message: string) => void }, mess
 /** Executable and arguments prepended to hunk's argv. */
 export interface HunkLauncher {
   bin: string;
+  /** Prefix for calls whose stdout is captured; must not allocate a TTY, which swallows output. */
   prefix: string[];
+  /** Prefix for launching the hunk TUI, which needs a terminal to survive. */
+  interactivePrefix: string[];
 }
 
 /**
- * Runs the bundled launcher with Node, bypassing platform-specific npm shims. When `worktree`
- * does not exist on this filesystem, the review most likely lives inside a Docker Sandbox whose
- * checkout never left the container (e.g. a `--clone` sandbox). In that case, look for a sandbox
- * whose workspace contains it and route the call through `sbx exec` instead, assuming a global
- * `hunk` install inside the sandbox (see README's pager setup section). Any failure along that
- * path — `sbx` missing, no matching sandbox, a malformed `sbx ls` response — falls back to the
- * bundled local launcher unchanged.
+ * Runs the bundled launcher with Node, bypassing platform-specific npm shims. A Docker Sandbox
+ * bind-mounts its workspace at the same host path it was created from, so the checkout is visible
+ * on both sides while the two hold independent git state — path existence cannot tell them apart.
+ * When a running sandbox claims `worktree`, the review therefore belongs to that sandbox, and the
+ * call is routed through `sbx exec`, assuming a global `hunk` install inside it (see README's
+ * pager setup section). Any failure along that path — `sbx` missing, no matching sandbox, a
+ * malformed `sbx ls` response — falls back to the bundled local launcher unchanged.
  */
 export function resolveHunkLauncher(
   cfg: PluginConfig,
@@ -43,29 +46,31 @@ export function resolveHunkLauncher(
   execPath: string = process.execPath,
   lookup: SandboxLookup = realSandboxLookup,
 ): HunkLauncher {
-  if (cfg.hunk.bin !== "auto") return { bin: cfg.hunk.bin, prefix: [] };
+  if (cfg.hunk.bin !== "auto") return { bin: cfg.hunk.bin, prefix: [], interactivePrefix: [] };
 
+  const bundled = [join(pluginRoot, "node_modules", "hunkdiff", "bin", "hunk.cjs")];
   const local: HunkLauncher = {
     bin: execPath,
-    prefix: [join(pluginRoot, "node_modules", "hunkdiff", "bin", "hunk.cjs")],
+    prefix: bundled,
+    interactivePrefix: bundled,
   };
 
   try {
-    if (lookup.exists(worktree)) return local;
-    console.error(
-      `hunkdiff: worktree "${worktree}" was not found locally; checking for a Docker Sandbox that has it.`,
-    );
     const sandbox = findSandboxForPath(worktree, lookup.listSandboxes());
-    if (!sandbox) {
-      console.error(
-        `hunkdiff: no sandbox workspace matches "${worktree}"; falling back to local hunk.`,
-      );
-      return local;
-    }
+    if (!sandbox) return local;
     console.error(
       `hunkdiff: routing hunk through "sbx exec ${sandbox} -- hunk" for "${worktree}".`,
     );
-    return { bin: "sbx", prefix: ["exec", sandbox, "hunk"] };
+    // `-w` pins the container cwd to the worktree, which a bind-mounted workspace exposes at the
+    // same path, so reviews of a subdirectory land in the right place. The TUI additionally needs
+    // `-it` or it finds no terminal and exits at once; captured-output calls must NOT get it,
+    // because `-t` sends their stdout to the pty and the caller reads an empty string.
+    const base = ["exec", "-w", worktree, sandbox, "hunk"];
+    return {
+      bin: "sbx",
+      prefix: base,
+      interactivePrefix: ["exec", "-it", "-w", worktree, sandbox, "hunk"],
+    };
   } catch (err) {
     console.error(
       `hunkdiff: could not resolve a Docker Sandbox for "${worktree}" ` +

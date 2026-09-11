@@ -4,14 +4,15 @@ import { DEFAULTS } from "../src/config.js";
 import { HerdrAdapter, resolveHunkLauncher } from "../src/herdr.js";
 import type { SandboxLookup } from "../src/sandbox.js";
 
-/** Worktree "exists" locally, so these tests never reach for a sandbox. */
-const LOCAL_LOOKUP: SandboxLookup = { exists: () => true, listSandboxes: () => [] };
+/** No sandbox claims the worktree, so these tests stay on the local launcher. */
+const LOCAL_LOOKUP: SandboxLookup = { listSandboxes: () => [] };
 
 describe("resolveHunkLauncher", () => {
   it("prefers the bundled hunkdiff when bin is auto", () => {
     expect(resolveHunkLauncher(DEFAULTS, "/plugin", "/wt", "/bin/node", LOCAL_LOOKUP)).toEqual({
       bin: "/bin/node",
       prefix: [join("/plugin", "node_modules", "hunkdiff", "bin", "hunk.cjs")],
+      interactivePrefix: [join("/plugin", "node_modules", "hunkdiff", "bin", "hunk.cjs")],
     });
   });
 
@@ -37,32 +38,57 @@ describe("resolveHunkLauncher", () => {
     expect(resolveHunkLauncher(cfg, "/plugin", "/wt")).toEqual({
       bin: "/usr/local/bin/hunk",
       prefix: [],
+      interactivePrefix: [],
     });
   });
 
   describe("Docker Sandbox fallback", () => {
     it("routes through sbx exec when the worktree only exists inside a matching sandbox", () => {
       const lookup: SandboxLookup = {
-        exists: () => false,
-        listSandboxes: () => [{ name: "my-sandbox", workspace: "/wt/project" }],
+        listSandboxes: () => [
+          { name: "my-sandbox", workspaces: ["/wt/project"], status: "running" },
+        ],
       };
       expect(resolveHunkLauncher(DEFAULTS, "/plugin", "/wt/project", "/bin/node", lookup)).toEqual({
         bin: "sbx",
-        prefix: ["exec", "my-sandbox", "hunk"],
+        prefix: ["exec", "-w", "/wt/project", "my-sandbox", "hunk"],
+        interactivePrefix: ["exec", "-it", "-w", "/wt/project", "my-sandbox", "hunk"],
       });
     });
 
+    it("allocates a TTY only for the TUI, never for calls whose stdout is captured", () => {
+      const lookup: SandboxLookup = {
+        listSandboxes: () => [
+          { name: "my-sandbox", workspaces: ["/wt/project"], status: "running" },
+        ],
+      };
+      const { prefix, interactivePrefix } = resolveHunkLauncher(
+        DEFAULTS,
+        "/plugin",
+        "/wt/project/sub",
+        "/bin/node",
+        lookup,
+      );
+      // Without -it the TUI finds no terminal and exits, and herdr closes the pane.
+      expect(interactivePrefix).toContain("-it");
+      // With -t, stdout goes to the pty and the caller parses an empty string instead of JSON.
+      expect(prefix).not.toContain("-it");
+      expect(prefix).not.toContain("-t");
+      // The workspace is bind-mounted at the same path, so the subdirectory resolves inside too.
+      expect(prefix).toEqual(["exec", "-w", "/wt/project/sub", "my-sandbox", "hunk"]);
+    });
+
     it("falls back to local hunk when no sandbox matches", () => {
-      const lookup: SandboxLookup = { exists: () => false, listSandboxes: () => [] };
+      const lookup: SandboxLookup = { listSandboxes: () => [] };
       expect(resolveHunkLauncher(DEFAULTS, "/plugin", "/wt/project", "/bin/node", lookup)).toEqual({
         bin: "/bin/node",
         prefix: [join("/plugin", "node_modules", "hunkdiff", "bin", "hunk.cjs")],
+        interactivePrefix: [join("/plugin", "node_modules", "hunkdiff", "bin", "hunk.cjs")],
       });
     });
 
     it("falls back to local hunk when sbx itself is unavailable", () => {
       const lookup: SandboxLookup = {
-        exists: () => false,
         listSandboxes: () => {
           throw new Error("spawn sbx ENOENT");
         },
@@ -72,24 +98,24 @@ describe("resolveHunkLauncher", () => {
       );
     });
 
-    it("does not consult sbx at all when the worktree already exists locally", () => {
-      let called = false;
-      resolveHunkLauncher(DEFAULTS, "/plugin", "/wt", "/bin/node", {
-        exists: () => true,
-        listSandboxes: () => {
-          called = true;
-          return [];
-        },
-      });
-      expect(called).toBe(false);
+    it("ignores a stopped sandbox, which `sbx exec` could not reach anyway", () => {
+      const lookup: SandboxLookup = {
+        listSandboxes: () => [
+          { name: "my-sandbox", workspaces: ["/wt/project"], status: "stopped" },
+        ],
+      };
+      expect(resolveHunkLauncher(DEFAULTS, "/plugin", "/wt/project", "/bin/node", lookup).bin).toBe(
+        "/bin/node",
+      );
     });
 
     describe("debug tracing (visible via `herdr plugin log list`)", () => {
       it("logs which sandbox it routed hunk through", () => {
         const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
         const lookup: SandboxLookup = {
-          exists: () => false,
-          listSandboxes: () => [{ name: "my-sandbox", workspace: "/wt/project" }],
+          listSandboxes: () => [
+            { name: "my-sandbox", workspaces: ["/wt/project"], status: "running" },
+          ],
         };
         resolveHunkLauncher(DEFAULTS, "/plugin", "/wt/project", "/bin/node", lookup);
         expect(errorSpy).toHaveBeenCalledWith(
@@ -98,20 +124,9 @@ describe("resolveHunkLauncher", () => {
         errorSpy.mockRestore();
       });
 
-      it("logs why it fell back to local hunk when no sandbox matches", () => {
-        const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-        const lookup: SandboxLookup = { exists: () => false, listSandboxes: () => [] };
-        resolveHunkLauncher(DEFAULTS, "/plugin", "/wt/project", "/bin/node", lookup);
-        expect(errorSpy).toHaveBeenCalledWith(
-          expect.stringContaining('no sandbox workspace matches "/wt/project"'),
-        );
-        errorSpy.mockRestore();
-      });
-
       it("logs the underlying error when sbx itself is unavailable", () => {
         const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
         const lookup: SandboxLookup = {
-          exists: () => false,
           listSandboxes: () => {
             throw new Error("spawn sbx ENOENT");
           },
@@ -121,7 +136,7 @@ describe("resolveHunkLauncher", () => {
         errorSpy.mockRestore();
       });
 
-      it("stays silent when the worktree already exists locally", () => {
+      it("stays quiet when no sandbox claims the worktree", () => {
         const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
         resolveHunkLauncher(DEFAULTS, "/plugin", "/wt", "/bin/node", LOCAL_LOOKUP);
         expect(errorSpy).not.toHaveBeenCalled();

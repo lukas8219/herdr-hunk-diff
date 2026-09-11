@@ -59,7 +59,7 @@ export function resolveAndRun(
   const launcher = resolveHunkLauncher(cfg, env.HERDR_PLUGIN_ROOT ?? cwd, target.worktree);
   const result = spawn(
     launcher.bin,
-    [...launcher.prefix, ...buildLaunchArgs(target, cfg, sidecar)],
+    [...launcher.interactivePrefix, ...buildLaunchArgs(target, cfg, sidecar)],
     {
       stdio: "inherit",
       cwd: target.worktree,
