@@ -344,14 +344,20 @@ a separately installed binary.
 agent notes. `extra_args` appends string arguments to every hunk launch. If any list item is not a
 string, the entire list is rejected to avoid constructing a partial command.
 
-With `bin = "auto"`, if the review's worktree does not exist on this filesystem — for example, an
-agent working inside a [Docker Sandbox](https://docs.docker.com/ai/sandboxes/) `--clone` checkout
-that never left the container — the plugin looks for a sandbox whose workspace contains that path
-(via `sbx ls --json`) and runs hunk there instead, through `sbx exec <sandbox> -- hunk`. This
-assumes hunk is installed globally inside the sandbox (see
-[Optional VCS pager setup](#optional-vcs-pager-setup)). Any failure along that path — `sbx` not
-installed, no matching sandbox, an unreadable `sbx ls` response — falls back to the bundled local
-hunk unchanged.
+With `bin = "auto"`, the plugin checks whether the review's worktree belongs to a running
+[Docker Sandbox](https://docs.docker.com/ai/sandboxes/). A sandbox mounts its workspace at the
+same host path it was created from, so the checkout is visible on both sides while each keeps its
+own git state — a review run locally against a sandbox's workspace shows the host's diff, not the
+work the agent did inside. So when `sbx ls --json` reports a **running** sandbox whose workspace
+contains the worktree, hunk is launched through `sbx exec <sandbox> -- hunk` instead. This assumes
+hunk is installed globally inside the sandbox (see
+[Optional VCS pager setup](#optional-vcs-pager-setup)). Stopped sandboxes are ignored, since
+`sbx exec` cannot reach them. Any failure along that path — `sbx` not installed, no matching
+sandbox, an unreadable `sbx ls` response — falls back to the bundled local hunk unchanged.
+
+Note the trade-off: because host and sandbox share the path, a review you intended to run against
+the host checkout is also routed into the sandbox whenever one is running for that directory. Set
+`hunk.bin` to an explicit path to opt out.
 
 ## Optional VCS pager setup
 

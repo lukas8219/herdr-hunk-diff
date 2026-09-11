@@ -1,16 +1,15 @@
-import { existsSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { isAbsolute, relative, resolve } from "node:path";
 
 export interface SandboxInfo {
   name: string;
-  /** Host-visible workspace path `sbx ls` reports for this sandbox, when it has one. */
-  workspace?: string;
+  /** Host-visible workspace paths `sbx ls` reports for this sandbox. */
+  workspaces: string[];
+  /** `sbx` lifecycle status; only a running sandbox can execute anything. */
+  status?: string;
 }
 
 export interface SandboxLookup {
-  /** True when `path` exists on the filesystem the plugin process itself runs on. */
-  exists: (path: string) => boolean;
   /** Lists sandboxes known to `sbx`. Returns `[]` when `sbx` is unavailable or reports none. */
   listSandboxes: () => SandboxInfo[];
 }
@@ -21,20 +20,39 @@ function containsPath(outer: string, inner: string): boolean {
   return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
 }
 
-/** Picks the sandbox whose workspace contains `path`, preferring the most specific match. */
-export function findSandboxForPath(path: string, sandboxes: SandboxInfo[]): string | undefined {
-  const candidates = sandboxes.filter(
-    (s): s is SandboxInfo & { workspace: string } =>
-      typeof s.workspace === "string" && s.workspace.length > 0 && containsPath(s.workspace, path),
-  );
-  if (candidates.length === 0) return undefined;
-  return candidates.reduce((best, s) => (s.workspace.length > best.workspace.length ? s : best))
-    .name;
+/** Longest workspace of `s` that contains `path`, or undefined when none does. */
+function matchDepth(s: SandboxInfo, path: string): number | undefined {
+  const lengths = s.workspaces
+    .filter((w) => w.length > 0 && containsPath(w, path))
+    .map((w) => w.length);
+  return lengths.length > 0 ? Math.max(...lengths) : undefined;
 }
 
 /**
- * Accepts the documented `sbx ls --json` shape (a `SANDBOX`/`WORKSPACE` table serialized as
- * objects) plus a couple of reasonable variants, and degrades to no sandboxes rather than throw.
+ * Picks the running sandbox whose workspace contains `path`, preferring the most specific match.
+ * Stopped sandboxes are skipped: `sbx exec` cannot reach them, so routing there would only turn a
+ * usable local review into a failure.
+ */
+export function findSandboxForPath(path: string, sandboxes: SandboxInfo[]): string | undefined {
+  let best: { name: string; depth: number } | undefined;
+  for (const s of sandboxes) {
+    if (s.status !== undefined && s.status !== "running") continue;
+    const depth = matchDepth(s, path);
+    if (depth === undefined) continue;
+    if (!best || depth > best.depth) best = { name: s.name, depth };
+  }
+  return best?.name;
+}
+
+function asStringArray(value: unknown): string[] {
+  if (Array.isArray(value))
+    return value.filter((v): v is string => typeof v === "string" && v !== "");
+  return typeof value === "string" && value !== "" ? [value] : [];
+}
+
+/**
+ * Reads the `sbx ls --json` shape (`{sandboxes: [{name, status, workspaces: [...]}]}`), tolerating
+ * a bare array and a singular `workspace` string, and degrades to no sandboxes rather than throw.
  */
 export function parseSandboxList(value: unknown): SandboxInfo[] {
   const list = Array.isArray(value)
@@ -50,16 +68,25 @@ export function parseSandboxList(value: unknown): SandboxInfo[] {
     const fields = item as Record<string, unknown>;
     const name = fields.name ?? fields.sandbox;
     if (typeof name !== "string" || name === "") return [];
-    const workspace = fields.workspace;
-    return [{ name, workspace: typeof workspace === "string" ? workspace : undefined }];
+    const workspaces = [...asStringArray(fields.workspaces), ...asStringArray(fields.workspace)];
+    return [
+      { name, workspaces, status: typeof fields.status === "string" ? fields.status : undefined },
+    ];
   });
 }
 
+/*
+ * `sbx ls` costs a process spawn (~0.3s) and the launcher is resolved once per review action, so
+ * memoize for the life of the process. Plugin entrypoints are short-lived, so a sandbox started
+ * mid-process is not a case worth invalidating for.
+ */
+let cached: SandboxInfo[] | undefined;
+
 export const realSandboxLookup: SandboxLookup = {
-  exists: existsSync,
   listSandboxes: () => {
+    if (cached) return cached;
     const r = spawnSync("sbx", ["ls", "--json"], { encoding: "utf8" });
-    if (r.status !== 0 || !r.stdout) return [];
-    return parseSandboxList(JSON.parse(r.stdout));
+    cached = r.status !== 0 || !r.stdout ? [] : parseSandboxList(JSON.parse(r.stdout));
+    return cached;
   },
 };
