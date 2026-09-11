@@ -52,9 +52,25 @@ export function resolveHunkLauncher(
 
   try {
     if (lookup.exists(worktree)) return local;
+    console.error(
+      `hunkdiff: worktree "${worktree}" was not found locally; checking for a Docker Sandbox that has it.`,
+    );
     const sandbox = findSandboxForPath(worktree, lookup.listSandboxes());
-    return sandbox ? { bin: "sbx", prefix: ["exec", sandbox, "hunk"] } : local;
-  } catch {
+    if (!sandbox) {
+      console.error(
+        `hunkdiff: no sandbox workspace matches "${worktree}"; falling back to local hunk.`,
+      );
+      return local;
+    }
+    console.error(
+      `hunkdiff: routing hunk through "sbx exec ${sandbox} -- hunk" for "${worktree}".`,
+    );
+    return { bin: "sbx", prefix: ["exec", sandbox, "hunk"] };
+  } catch (err) {
+    console.error(
+      `hunkdiff: could not resolve a Docker Sandbox for "${worktree}" ` +
+        `(${err instanceof Error ? err.message : String(err)}); falling back to local hunk.`,
+    );
     return local;
   }
 }
